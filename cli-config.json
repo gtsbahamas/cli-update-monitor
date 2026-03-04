@@ -1,0 +1,9 @@
+{
+  "clis": [
+    "vercel",
+    "gh",
+    "supabase",
+    "fly"
+  ],
+  "custom": {}
+}

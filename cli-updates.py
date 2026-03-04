@@ -7,11 +7,12 @@ so Claude can warn about needed updates on session start.
 Usage:
     cli-updates.py              # Check all configured CLIs
     cli-updates.py --verbose    # Show detailed output
-    cli-updates.py --add <cli>  # Add a CLI to monitor
+    cli-updates.py --add <cli>  # Add a CLI to monitor (auto-detects or prompts)
     cli-updates.py --list       # List monitored CLIs
 """
 
 import json
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -71,6 +72,9 @@ DEFAULT_CLIS = {
     },
 }
 
+# Common version output patterns for auto-detection
+VERSION_PATTERN = re.compile(r"(\d+\.\d+\.\d+)")
+
 
 def log(msg: str, verbose: bool = False):
     """Log to file and optionally stdout."""
@@ -96,6 +100,14 @@ def run_cmd(cmd: list[str], timeout: int = 30) -> Optional[str]:
         return None
     except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
         return None
+
+
+def extract_semver(text: str) -> Optional[str]:
+    """Extract first semver-like version (X.Y.Z) from any text."""
+    if not text:
+        return None
+    match = VERSION_PATTERN.search(text)
+    return match.group(1) if match else None
 
 
 def parse_version(output: str, parse_type: str) -> Optional[str]:
@@ -149,6 +161,10 @@ def parse_version(output: str, parse_type: str) -> Optional[str]:
             if part and part[0].isdigit():
                 return part
         return None
+
+    elif parse_type == "auto":
+        # Generic: extract first semver from output
+        return extract_semver(output)
 
     return output.strip()
 
@@ -253,11 +269,21 @@ def check_all(verbose: bool = False) -> dict:
     }
 
     for cli_name in config.get("clis", []):
-        # Get CLI config (from defaults or custom)
+        # Get CLI config: custom > default > auto-detect
         cli_config = config.get("custom", {}).get(cli_name) or DEFAULT_CLIS.get(cli_name)
         if not cli_config:
-            log(f"{cli_name}: no configuration found, skipping", verbose)
-            continue
+            # Try auto-detect before skipping
+            cli_config = auto_detect_cli(cli_name, verbose)
+            if cli_config:
+                # Save the detected config for future runs
+                if "custom" not in config:
+                    config["custom"] = {}
+                config["custom"][cli_name] = cli_config
+                save_config(config)
+                log(f"{cli_name}: auto-detected config saved", verbose)
+            else:
+                log(f"{cli_name}: no configuration found and auto-detect failed, skipping", verbose)
+                continue
 
         status = check_cli(cli_name, cli_config, verbose)
         results["clis"][cli_name] = status
@@ -282,26 +308,242 @@ def check_all(verbose: bool = False) -> dict:
     return results
 
 
+def auto_detect_cli(name: str, verbose: bool = False) -> Optional[dict]:
+    """Try to auto-detect how to check a CLI's version and latest release.
+
+    Attempts common patterns:
+    1. <name> --version (most CLIs)
+    2. <name> -v
+    3. <name> version
+    Then checks npm and brew for latest version.
+    """
+    log(f"{name}: attempting auto-detection...", verbose)
+
+    # Step 1: Find a working version command
+    version_cmd = None
+    version_output = None
+    for cmd_variant in [
+        [name, "--version"],
+        [name, "-v"],
+        [name, "version"],
+        [name, "-V"],
+    ]:
+        output = run_cmd(cmd_variant, timeout=10)
+        if output and extract_semver(output):
+            version_cmd = cmd_variant
+            version_output = output
+            log(f"{name}: version command found: {' '.join(cmd_variant)} -> {extract_semver(output)}", verbose)
+            break
+
+    if not version_cmd:
+        log(f"{name}: could not find a working version command", verbose)
+        return None
+
+    # Step 2: Find a working latest-version source
+    latest_cmd = None
+    parse_latest_type = None
+
+    # Try npm first (most JS/Node CLIs)
+    npm_output = run_cmd(["npm", "show", name, "version"], timeout=15)
+    if npm_output and extract_semver(npm_output):
+        latest_cmd = ["npm", "show", name, "version"]
+        parse_latest_type = None  # default (plain text)
+        log(f"{name}: latest version source: npm -> {npm_output.strip()}", verbose)
+    else:
+        # Try brew
+        brew_output = run_cmd(["brew", "info", name, "--json"], timeout=15)
+        if brew_output:
+            try:
+                data = json.loads(brew_output)
+                if isinstance(data, list) and len(data) > 0:
+                    stable = data[0].get("versions", {}).get("stable")
+                    if stable:
+                        latest_cmd = ["brew", "info", name, "--json"]
+                        parse_latest_type = "brew_json"
+                        log(f"{name}: latest version source: brew -> {stable}", verbose)
+            except json.JSONDecodeError:
+                pass
+
+    if not latest_cmd:
+        # Try pip (Python CLIs)
+        pip_output = run_cmd(["pip", "index", "versions", name], timeout=15)
+        if pip_output and extract_semver(pip_output):
+            latest_cmd = ["pip", "index", "versions", name]
+            parse_latest_type = None
+            log(f"{name}: latest version source: pip -> {extract_semver(pip_output)}", verbose)
+
+    if not latest_cmd:
+        log(f"{name}: could not find a latest version source (tried npm, brew, pip)", verbose)
+        return None
+
+    # Step 3: Determine update command
+    if latest_cmd[0] == "npm":
+        update_cmd = f"npm install -g {name}"
+    elif latest_cmd[0] == "brew":
+        update_cmd = f"brew upgrade {name}"
+    elif latest_cmd[0] == "pip":
+        update_cmd = f"pip install --upgrade {name}"
+    else:
+        update_cmd = f"# update {name} manually"
+
+    config = {
+        "version_cmd": version_cmd,
+        "latest_cmd": latest_cmd,
+        "update_cmd": update_cmd,
+        "parse_version": "auto",
+        "critical": False,
+    }
+    if parse_latest_type:
+        config["parse_latest"] = parse_latest_type
+
+    log(f"{name}: auto-detection successful", verbose)
+    return config
+
+
 def add_cli(name: str, verbose: bool = False):
-    """Add a CLI to the monitor list."""
+    """Add a CLI to the monitor list. Auto-detects config or prompts interactively."""
     config = load_config()
-    if name not in config["clis"]:
+
+    if name in config.get("clis", []):
+        print(f"{name} is already being monitored")
+        return
+
+    # Check if it's a built-in default
+    if name in DEFAULT_CLIS:
         config["clis"].append(name)
         save_config(config)
-        log(f"Added {name} to monitor list", verbose)
-        print(f"Added {name} to monitor list")
+        print(f"Added {name} (built-in config)")
+        return
+
+    # Try auto-detection
+    print(f"Detecting {name}...")
+    detected = auto_detect_cli(name, verbose=verbose)
+
+    if detected:
+        installed = extract_semver(run_cmd(detected["version_cmd"]) or "")
+        latest_raw = run_cmd(detected["latest_cmd"])
+        latest = extract_semver(latest_raw) if latest_raw else None
+
+        print(f"\nAuto-detected config for {name}:")
+        print(f"  Version command:  {' '.join(detected['version_cmd'])}")
+        print(f"  Installed:        {installed or 'unknown'}")
+        print(f"  Latest source:    {' '.join(detected['latest_cmd'])}")
+        print(f"  Latest version:   {latest or 'unknown'}")
+        print(f"  Update command:   {detected['update_cmd']}")
+        print(f"  Critical:         {detected['critical']}")
+
+        response = input("\nUse this config? [Y/n/c(ustomize)] ").strip().lower()
+
+        if response in ("", "y", "yes"):
+            if "custom" not in config:
+                config["custom"] = {}
+            config["custom"][name] = detected
+            config["clis"].append(name)
+            save_config(config)
+            print(f"Added {name} with auto-detected config")
+            return
+
+        elif response in ("c", "customize"):
+            detected = interactive_config(name, detected)
+            if detected:
+                if "custom" not in config:
+                    config["custom"] = {}
+                config["custom"][name] = detected
+                config["clis"].append(name)
+                save_config(config)
+                print(f"Added {name} with custom config")
+            return
+
+        else:
+            print("Cancelled")
+            return
+
+    # Auto-detect failed — fall through to interactive
+    print(f"Could not auto-detect {name}. Entering interactive setup.\n")
+    custom = interactive_config(name)
+    if custom:
+        if "custom" not in config:
+            config["custom"] = {}
+        config["custom"][name] = custom
+        config["clis"].append(name)
+        save_config(config)
+        print(f"Added {name} with custom config")
+
+
+def interactive_config(name: str, defaults: Optional[dict] = None) -> Optional[dict]:
+    """Interactively configure a CLI monitor entry."""
+    defaults = defaults or {}
+
+    print(f"Configure monitoring for: {name}")
+    print("(Press Enter to accept defaults shown in brackets)\n")
+
+    # Version command
+    default_vcmd = " ".join(defaults.get("version_cmd", [name, "--version"]))
+    vcmd = input(f"  Version command [{default_vcmd}]: ").strip()
+    if not vcmd:
+        vcmd = default_vcmd
+    version_cmd = vcmd.split()
+
+    # Verify it works
+    test_output = run_cmd(version_cmd, timeout=10)
+    if test_output:
+        detected_ver = extract_semver(test_output)
+        print(f"    -> Output: {test_output.split(chr(10))[0]}")
+        print(f"    -> Detected version: {detected_ver or 'could not parse'}")
     else:
-        print(f"{name} is already being monitored")
+        print(f"    -> WARNING: command failed. Continuing anyway.")
+
+    # Latest version command
+    default_lcmd = " ".join(defaults.get("latest_cmd", ["npm", "show", name, "version"]))
+    lcmd = input(f"  Latest version command [{default_lcmd}]: ").strip()
+    if not lcmd:
+        lcmd = default_lcmd
+    latest_cmd = lcmd.split()
+
+    # Determine parse_latest type
+    parse_latest_type = defaults.get("parse_latest")
+    if latest_cmd[0] == "brew" and "--json" in latest_cmd:
+        parse_latest_type = "brew_json"
+
+    # Update command
+    default_ucmd = defaults.get("update_cmd", f"npm install -g {name}")
+    ucmd = input(f"  Update command [{default_ucmd}]: ").strip()
+    if not ucmd:
+        ucmd = default_ucmd
+
+    # Critical flag
+    crit = input(f"  Critical (blocks deploys)? [y/N] ").strip().lower()
+    critical = crit in ("y", "yes")
+
+    config = {
+        "version_cmd": version_cmd,
+        "latest_cmd": latest_cmd,
+        "update_cmd": ucmd,
+        "parse_version": "auto",
+        "critical": critical,
+    }
+    if parse_latest_type:
+        config["parse_latest"] = parse_latest_type
+
+    return config
 
 
 def list_clis():
-    """List all monitored CLIs."""
+    """List all monitored CLIs with source info."""
     config = load_config()
+    custom = config.get("custom", {})
     print("Monitored CLIs:")
     for cli in config.get("clis", []):
-        info = DEFAULT_CLIS.get(cli, {})
-        critical = " [CRITICAL]" if info.get("critical") else ""
-        print(f"  - {cli}{critical}")
+        if cli in DEFAULT_CLIS:
+            source = "built-in"
+            critical = " [CRITICAL]" if DEFAULT_CLIS[cli].get("critical") else ""
+        elif cli in custom:
+            source = "custom"
+            critical = " [CRITICAL]" if custom[cli].get("critical") else ""
+        else:
+            source = "unconfigured"
+            critical = ""
+        print(f"  - {cli} ({source}){critical}")
 
 
 def main():

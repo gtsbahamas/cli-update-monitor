@@ -21,7 +21,7 @@ Session starts, you see the warning, update in 10 seconds, keep moving.
 ## Quick Install (macOS)
 
 ```bash
-git clone https://github.com/tywells/cli-update-monitor.git
+git clone https://github.com/gtsbahamas/cli-update-monitor.git
 cd cli-update-monitor
 chmod +x install.sh
 ./install.sh
@@ -54,20 +54,70 @@ launchctl load ~/Library/LaunchAgents/com.claude.cli-monitor.plist
 python3 ~/.claude/monitors/cli-updates.py --verbose
 ```
 
-## Configuration
+## Adding CLIs
 
-Edit `~/.claude/monitors/cli-config.json`:
+### Built-in CLIs (zero config)
 
-```json
-{
-  "clis": ["vercel", "gh", "supabase", "fly"],
-  "custom": {}
-}
+6 CLIs work out of the box: `vercel`, `gh`, `supabase`, `fly`, `railway`, `wrangler`
+
+```bash
+python3 cli-updates.py --add vercel
+# Added vercel (built-in config)
 ```
 
-**Built-in CLIs:** vercel, gh, supabase, fly, railway, wrangler
+### Any other CLI (auto-detected)
 
-**Add a custom CLI:**
+The monitor auto-detects any globally installed CLI. It tries common version commands (`--version`, `-v`, `version`), then checks npm, brew, and pip for the latest release.
+
+```bash
+python3 cli-updates.py --add node
+```
+
+```
+Detecting node...
+node: version command found: node --version -> 25.2.1
+node: latest version source: npm -> 25.8.0
+
+Auto-detected config for node:
+  Version command:  node --version
+  Installed:        25.2.1
+  Latest source:    npm show node version
+  Latest version:   25.8.0
+  Update command:   npm install -g node
+  Critical:         False
+
+Use this config? [Y/n/c(ustomize)]
+```
+
+Press Enter to accept, or `c` to customize any field.
+
+### Fully custom (interactive)
+
+If auto-detect fails (CLI not installed, unusual version format), it drops into interactive setup:
+
+```bash
+python3 cli-updates.py --add my-private-tool
+```
+
+```
+Could not auto-detect my-private-tool. Entering interactive setup.
+
+Configure monitoring for: my-private-tool
+(Press Enter to accept defaults shown in brackets)
+
+  Version command [my-private-tool --version]: my-private-tool info --ver
+    -> Output: my-private-tool v2.1.0-beta
+    -> Detected version: 2.1.0
+  Latest version command [npm show my-private-tool version]:
+  Update command [npm install -g my-private-tool]:
+  Critical (blocks deploys)? [y/N]: y
+
+Added my-private-tool with custom config
+```
+
+### Manual JSON (if you prefer)
+
+Edit `~/.claude/monitors/cli-config.json` directly:
 
 ```json
 {
@@ -77,28 +127,23 @@ Edit `~/.claude/monitors/cli-config.json`:
       "version_cmd": ["my-tool", "--version"],
       "latest_cmd": ["npm", "show", "my-tool", "version"],
       "update_cmd": "npm install -g my-tool",
-      "parse_version": "first_line",
+      "parse_version": "auto",
       "critical": true
     }
   }
 }
 ```
 
-Or via CLI:
-```bash
-python3 ~/.claude/monitors/cli-updates.py --add my-tool
-```
-
 ## Usage
 
 ```bash
-# Manual check
+# Check all CLIs now
 python3 ~/.claude/monitors/cli-updates.py --verbose
 
 # List monitored CLIs
 python3 ~/.claude/monitors/cli-updates.py --list
 
-# Add a CLI
+# Add a CLI (auto-detects or prompts)
 python3 ~/.claude/monitors/cli-updates.py --add <name>
 ```
 
@@ -128,14 +173,13 @@ Read this file on session start. If `critical_updates` is non-empty, update befo
 
 I read `cli-updates.json` at the start of every Claude Code session. Critical CLIs (vercel, supabase) get an immediate warning. Non-critical (gh, fly) are noted but don't block anything.
 
-The script is ~170 lines of Python. No dependencies. LaunchAgent handles scheduling. JSON file is the contract between the monitor and whatever reads it.
+No dependencies. LaunchAgent handles scheduling. JSON file is the contract between the monitor and whatever reads it.
 
 ## Requirements
 
 - macOS (uses LaunchAgent for scheduling)
 - Python 3.8+
-- `brew` (for checking gh/supabase/fly latest versions)
-- `npm` (for checking vercel/wrangler/railway latest versions)
+- `brew` and/or `npm` (for checking latest versions — uses whichever is available)
 
 ## Linux / Windows
 
